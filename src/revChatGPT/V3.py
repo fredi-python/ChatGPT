@@ -5,11 +5,16 @@ import argparse
 import json
 import os
 import sys
-from typing import AsyncGenerator, Generator, NoReturn
+from importlib.resources import path
+from pathlib import Path
+from typing import AsyncGenerator
+from typing import NoReturn
 
 import httpx
+import requests
 import tiktoken
 
+from . import __version__
 from . import typings as t
 from .utils import create_completer
 from .utils import create_keybindings
@@ -35,6 +40,7 @@ class Chatbot:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         reply_count: int = 1,
+        truncate_limit: int = None,
         system_prompt: str = "You are ChatGPT, a large language model trained by OpenAI. Respond conversationally",
     ) -> None:
         """
@@ -46,7 +52,7 @@ class Chatbot:
         self.max_tokens: int = max_tokens or (
             31000 if engine == "gpt-4-32k" else 7000 if engine == "gpt-4" else 4000
         )
-        self.truncate_limit: int = (
+        self.truncate_limit: int = truncate_limit or (
             30500 if engine == "gpt-4-32k" else 6500 if engine == "gpt-4" else 3500
         )
         self.temperature: float = temperature
@@ -56,12 +62,28 @@ class Chatbot:
         self.reply_count: int = reply_count
         self.timeout: float = timeout
         self.proxy = proxy
-        self.session = httpx.Client(
-            follow_redirects=True, proxies=proxy, timeout=timeout
+        self.session = requests.Session()
+        self.session.proxies.update(
+            {
+                "http": proxy,
+                "https": proxy,
+            },
         )
-        self.aclient = httpx.AsyncClient(
-            follow_redirects=True, proxies=proxy, timeout=timeout
-        )
+        if proxy := (
+            proxy or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY") or None
+        ):
+            if "socks5h" not in proxy:
+                self.aclient = httpx.AsyncClient(
+                    follow_redirects=True,
+                    proxies=proxy,
+                    timeout=timeout,
+                )
+        else:
+            self.aclient = httpx.AsyncClient(
+                follow_redirects=True,
+                proxies=proxy,
+                timeout=timeout,
+            )
 
         self.conversation: dict[str, list[dict]] = {
             "default": [
@@ -73,8 +95,7 @@ class Chatbot:
         }
 
         if self.get_token_count("default") > self.max_tokens:
-            error = t.ActionRefuseError("System prompt is too long")
-            raise error
+            raise t.ActionRefuseError("System prompt is too long")
 
     def add_to_conversation(
         self,
@@ -114,8 +135,7 @@ class Chatbot:
             "gpt-4-32k",
             "gpt-4-32k-0314",
         ]:
-            error = NotImplementedError("Unsupported engine {self.engine}")
-            raise error
+            raise NotImplementedError(f"Unsupported engine {self.engine}")
 
         tiktoken.model.MODEL_TO_ENCODING["gpt-4"] = "cl100k_base"
 
@@ -144,7 +164,7 @@ class Chatbot:
         role: str = "user",
         convo_id: str = "default",
         **kwargs,
-    ) -> Generator[str, None, None]:
+    ):
         """
         Ask a question
         """
@@ -154,8 +174,7 @@ class Chatbot:
         self.add_to_conversation(prompt, "user", convo_id=convo_id)
         self.__truncate_conversation(convo_id=convo_id)
         # Get response
-        with self.session.stream(
-            "post",
+        response = self.session.post(
             os.environ.get("API_URL") or "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {kwargs.get('api_key', self.api_key)}"},
             json={
@@ -178,37 +197,34 @@ class Chatbot:
                 "max_tokens": self.get_max_tokens(convo_id=convo_id),
             },
             timeout=kwargs.get("timeout", self.timeout),
-        ) as response:
-            if response.status_code != 200:
-                response.read()
-                error = t.APIConnectionError(
-                    f"{response.status_code} {response.reason_phrase} {response.text}",
-                )
-                raise error
-
-            response_role: str = ""
-            full_response: str = ""
-            for line in response.iter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                # Remove "data: "
-                line = line[6:]
-                if line == "[DONE]":
-                    break
-                resp: dict = json.loads(line)
-                choices = resp.get("choices")
-                if not choices:
-                    continue
-                delta: dict[str, str] = choices[0].get("delta")
-                if not delta:
-                    continue
-                if "role" in delta:
-                    response_role = delta["role"]
-                if "content" in delta:
-                    content: str = delta["content"]
-                    full_response += content
-                    yield content
+            stream=True,
+        )
+        if response.status_code != 200:
+            raise t.APIConnectionError(
+                f"{response.status_code} {response.reason} {response.text}",
+            )
+        response_role: str or None = None
+        full_response: str = ""
+        for line in response.iter_lines():
+            if not line:
+                continue
+            # Remove "data: "
+            line = line.decode("utf-8")[6:]
+            if line == "[DONE]":
+                break
+            resp: dict = json.loads(line)
+            choices = resp.get("choices")
+            if not choices:
+                continue
+            delta = choices[0].get("delta")
+            if not delta:
+                continue
+            if "role" in delta:
+                response_role = delta["role"]
+            if "content" in delta:
+                content = delta["content"]
+                full_response += content
+                yield content
         self.add_to_conversation(full_response, response_role, convo_id=convo_id)
 
     async def ask_stream_async(
@@ -254,10 +270,9 @@ class Chatbot:
         ) as response:
             if response.status_code != 200:
                 await response.aread()
-                error = t.APIConnectionError(
+                raise t.APIConnectionError(
                     f"{response.status_code} {response.reason_phrase} {response.text}",
                 )
-                raise error
 
             response_role: str = ""
             full_response: str = ""
@@ -356,7 +371,7 @@ class Chatbot:
                 indent=2,
             )
 
-    def load(self, file: str, *keys_: str) -> None:
+    def load(self, file: Path, *keys_: str) -> None:
         """
         Load the Chatbot configuration from a JSON file
         """
@@ -394,6 +409,10 @@ class Chatbot:
 
 
 class ChatbotCLI(Chatbot):
+    """
+    Command Line Interface for Chatbot
+    """
+
     def print_config(self, convo_id: str = "default") -> None:
         """
         Prints the current configuration
@@ -443,11 +462,11 @@ Examples:
   """,
         )
 
-    def handle_commands(self, input: str, convo_id: str = "default") -> bool:
+    def handle_commands(self, prompt: str, convo_id: str = "default") -> bool:
         """
         Handle chatbot commands
         """
-        command, *value = input.split(" ")
+        command, *value = prompt.split(" ")
         if command == "!help":
             self.print_help()
         elif command == "!exit":
@@ -494,9 +513,10 @@ def main() -> NoReturn:
     Main function
     """
     print(
-        """
+        f"""
     ChatGPT - Official ChatGPT API
     Repo: github.com/acheong08/ChatGPT
+    Version: {__version__}
     """,
     )
     print("Type '!help' to show a full list of commands")
@@ -569,16 +589,22 @@ def main() -> NoReturn:
         choices=["gpt-3.5-turbo", "gpt-4", "gpt-4-32k"],
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--truncate_limit",
+        type=int,
+        default=None,
+    )
+
+    args, _ = parser.parse_known_args()
 
     # Initialize chatbot
     if config := args.config or os.environ.get("GPT_CONFIG_PATH"):
         chatbot = ChatbotCLI(args.api_key)
         try:
             chatbot.load(config)
-        except Exception:
+        except Exception as err:
             print(f"Error: {args.config} could not be loaded")
-            sys.exit()
+            raise err
     else:
         chatbot = ChatbotCLI(
             api_key=args.api_key,
@@ -588,13 +614,12 @@ def main() -> NoReturn:
             top_p=args.top_p,
             reply_count=args.reply_count,
             engine=args.model,
+            truncate_limit=args.truncate_limit,
         )
     # Check if internet is enabled
     if args.enable_internet:
-        from importlib.resources import path
-
         config = path("revChatGPT", "config").__str__()
-        chatbot.load(os.path.join(config, "enable_internet.json"), "conversation")
+        chatbot.load(Path(config, "enable_internet.json"), "conversation")
 
     session = create_session()
     completer = create_completer(
@@ -631,8 +656,8 @@ def main() -> NoReturn:
         if prompt.startswith("!"):
             try:
                 chatbot.handle_commands(prompt)
-            except Exception as e:
-                print(f"Error: {e}")
+            except Exception as err:
+                print(f"Error: {err}")
             continue
         print()
         print("ChatGPT: ", flush=True)
@@ -646,7 +671,7 @@ def main() -> NoReturn:
             # Get search results
             search_results = '{"results": "No search results"}'
             if query != "none":
-                resp = httpx.post(
+                resp = requests.post(
                     url="https://ddg-api.herokuapp.com/search",
                     json={"query": query, "limit": 3},
                     timeout=10,
@@ -675,9 +700,8 @@ def main() -> NoReturn:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        error = t.CLIError("Command line program unknown error")
-        raise error from e
+    except Exception as exc:
+        raise t.CLIError("Command line program unknown error") from exc
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit()
